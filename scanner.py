@@ -1,0 +1,225 @@
+"""
+MA 터치 스캐너
+- S&P 500 / Russell 2000 / 내 관심종목을 훑어서
+- 당일 가격 범위가 50일 SMA, 200일 SMA, 100일 VWMA에 닿은 종목을
+- 디스코드 채널로 표 형태로 보냅니다.
+"""
+import datetime as dt
+import io
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import requests
+
+# ───────────── 설정 (여기만 고치면 됩니다) ─────────────
+GROUPS = os.environ.get("SCAN_GROUPS", "sp500,russell2000,watchlist").split(",")
+TOL_PCT = float(os.environ.get("TOL_PCT", "1.0"))      # 터치 허용 오차(%). 선의 ±1% 안에 들어오면 터치로 봄
+ONLY_FROM_ABOVE = os.environ.get("ONLY_FROM_ABOVE", "0") == "1"  # 1이면 전일 종가가 선 위에 있던 종목만 (눌림목). 0이면 양방향 모두
+MIN_PRICE = float(os.environ.get("MIN_PRICE", "5"))    # 이 가격 미만 종목 제외
+MIN_DOLLAR_VOL = float(os.environ.get("MIN_DOLLAR_VOL", "5000000"))  # 50일 평균 거래대금($) 하한
+WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
+FORCE = os.environ.get("FORCE", "0") == "1"            # 장 시간이 아니어도 강제 실행
+# ──────────────────────────────────────────────────────
+
+NY = ZoneInfo("America/New_York")
+STATE = Path(__file__).parent / "state"
+STATE.mkdir(exist_ok=True)
+UA = {"User-Agent": "Mozilla/5.0 (ma-touch-scanner)"}
+GROUP_LABEL = {"sp500": "S&P 500", "russell2000": "Russell 2000", "watchlist": "Watchlist"}
+MA_NAMES = ["50D SMA", "200D SMA", "100D VWMA"]
+
+
+# ───────────── 종목 목록 ─────────────
+def _fetch_sp500() -> pd.DataFrame:
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    html = requests.get(url, headers=UA, timeout=30).text
+    t = pd.read_html(io.StringIO(html))[0]
+    return pd.DataFrame({"ticker": t["Symbol"], "name": t["Security"], "industry": t["GICS Sub-Industry"]})
+
+
+def _fetch_russell2000() -> pd.DataFrame:
+    url = ("https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/"
+           "1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund")
+    text = requests.get(url, headers=UA, timeout=60).text
+    lines = text.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("Ticker,"))
+    t = pd.read_csv(io.StringIO("\n".join(lines[start:])))
+    t = t[t["Asset Class"] == "Equity"]
+    return pd.DataFrame({"ticker": t["Ticker"], "name": t["Name"], "industry": t["Sector"]})
+
+
+def _load_watchlist() -> pd.DataFrame:
+    p = Path(__file__).parent / "watchlist.txt"
+    rows = []
+    if p.exists():
+        for ln in p.read_text(encoding="utf-8").splitlines():
+            ln = ln.split("#")[0].strip()
+            if ln:
+                rows.append({"ticker": ln, "name": "", "industry": ""})
+    return pd.DataFrame(rows, columns=["ticker", "name", "industry"])
+
+
+def load_universe(group: str) -> pd.DataFrame:
+    if group == "watchlist":
+        return _load_watchlist()
+    cache = STATE / f"universe_{group}.csv"
+    fresh = cache.exists() and (time.time() - cache.stat().st_mtime) < 7 * 86400
+    if not fresh:
+        try:
+            df = {"sp500": _fetch_sp500, "russell2000": _fetch_russell2000}[group]()
+            if len(df) < 50:
+                raise ValueError("종목 수가 비정상적으로 적음")
+            df.to_csv(cache, index=False)
+        except Exception as e:  # 실패하면 지난 목록을 그대로 사용
+            print(f"[경고] {group} 목록 갱신 실패: {e}")
+    if not cache.exists():
+        return pd.DataFrame(columns=["ticker", "name", "industry"])
+    df = pd.read_csv(cache).fillna("")
+    df["ticker"] = df["ticker"].astype(str).str.strip().str.replace(".", "-", regex=False)  # BRK.B → BRK-B
+    df = df[df["ticker"].str.fullmatch(r"[A-Z\-]{1,6}")]
+    return df.drop_duplicates("ticker")
+
+
+# ───────────── 시세 ─────────────
+def download(tickers: list[str]):
+    import yfinance as yf
+    for i in range(0, len(tickers), 200):
+        chunk = tickers[i:i + 200]
+        try:
+            data = yf.download(chunk, period="1y", interval="1d", group_by="ticker",
+                               auto_adjust=False, threads=True, progress=False)
+        except Exception as e:
+            print(f"[경고] 시세 다운로드 실패({chunk[0]}…): {e}")
+            continue
+        if not isinstance(data.columns, pd.MultiIndex):
+            data = pd.concat({chunk[0]: data}, axis=1)
+        have = set(data.columns.get_level_values(0))
+        for t in chunk:
+            if t in have:
+                yield t, data[t]
+        time.sleep(1)
+
+
+def check_touches(df: pd.DataFrame, today: dt.date | None) -> list[dict]:
+    """한 종목의 일봉에서 오늘 터치한 선들을 반환 (today가 None이면 가장 최근 거래일 기준)"""
+    df = df.dropna(subset=["Close", "High", "Low", "Volume"])
+    if len(df) < 60 or (today is not None and df.index[-1].date() != today):
+        return []
+    c, v = df["Close"], df["Volume"]
+    last, prev = df.iloc[-1], df.iloc[-2]
+    if last["Close"] < MIN_PRICE or (c * v).tail(50).mean() < MIN_DOLLAR_VOL:
+        return []
+    mas = {
+        "50D SMA": c.rolling(50).mean().iloc[-1],
+        "200D SMA": c.rolling(200).mean().iloc[-1],
+        "100D VWMA": ((c * v).rolling(100).sum() / v.rolling(100).sum()).iloc[-1],
+    }
+    tol = TOL_PCT / 100
+    out = []
+    for name, ma in mas.items():
+        if pd.isna(ma):
+            continue
+        touched = last["Low"] <= ma * (1 + tol) and last["High"] >= ma * (1 - tol)
+        if touched and (not ONLY_FROM_ABOVE or prev["Close"] > ma):
+            out.append({"ma_name": name, "ma": float(ma), "low": float(last["Low"]), "last": float(last["Close"])})
+    return out
+
+
+# ───────────── 디스코드 ─────────────
+def post(content: str):
+    if not WEBHOOK:
+        print(content)
+        return
+    for _ in range(5):
+        r = requests.post(WEBHOOK, json={"content": content}, timeout=30)
+        if r.status_code == 429:
+            time.sleep(float(r.json().get("retry_after", 2)) + 0.5)
+            continue
+        r.raise_for_status()
+        time.sleep(0.6)
+        return
+
+
+def send_table(title: str, rows: list[dict]):
+    head = f"{'TIME':<6}{'TICKER':<8}{'DESCRIPTION':<22}{'INDUSTRY':<22}{'MA':>9}{'LOW':>9}{'LAST':>9}"
+    lines = [
+        f"{r['time']:<6}{r['ticker']:<8}{r['name'][:20]:<22}{r['industry'][:20]:<22}"
+        f"{r['ma']:>9.2f}{r['low']:>9.2f}{r['last']:>9.2f}"
+        for r in rows
+    ]
+    first = True
+    while lines:
+        block, size = [], 0
+        while lines and size + len(lines[0]) + 1 < 1700:
+            size += len(lines[0]) + 1
+            block.append(lines.pop(0))
+        header = f"**{title}**\n" if first else ""
+        post(f"{header}```\n{head}\n" + "\n".join(block) + "\n```")
+        first = False
+
+
+# ───────────── 실행 ─────────────
+def main():
+    now = dt.datetime.now(NY)
+    is_open = now.weekday() < 5 and dt.time(9, 35) <= now.time() <= dt.time(16, 30)
+    if not is_open and not FORCE:
+        print(f"장 시간이 아님 ({now:%Y-%m-%d %H:%M} ET). 종료.")
+        return
+    today = now.date()
+
+    # 오늘 이미 보낸 알림 (같은 종목·같은 선은 하루 1회)
+    sent_file = STATE / f"sent_{today}.json"
+    sent = set(json.loads(sent_file.read_text())) if sent_file.exists() and not FORCE else set()
+    for old in STATE.glob("sent_*.json"):
+        if old != sent_file:
+            old.unlink()
+
+    universes = {g.strip(): load_universe(g.strip()) for g in GROUPS if g.strip()}
+    meta, group_of = {}, {}
+    for g, u in universes.items():
+        for row in u.itertuples():
+            if row.ticker not in meta:          # 여러 그룹에 있으면 먼저 나온 그룹으로 분류
+                meta[row.ticker] = row
+                group_of[row.ticker] = g
+    print(f"스캔 대상 {len(meta)}종목")
+    if not meta:
+        post("⚠️ MA 스캐너: 종목 목록을 불러오지 못했습니다. Actions 로그를 확인하세요.")
+        return
+
+    found: dict[tuple, list] = {}
+    scanned = 0
+    for ticker, df in download(list(meta)):
+        scanned += 1
+        for t in check_touches(df, None if FORCE else today):  # 테스트 실행은 최근 거래일 기준
+            key = f"{ticker}|{t['ma_name']}"
+            if key in sent:
+                continue
+            sent.add(key)
+            m = meta[ticker]
+            found.setdefault((group_of[ticker], t["ma_name"]), []).append(
+                {"time": f"{now:%H:%M}", "ticker": ticker, "name": str(m.name), "industry": str(m.industry), **t})
+
+    total = sum(len(v) for v in found.values())
+    print(f"시세 확인 {scanned}종목, 신규 터치 {total}건")
+    for g in universes:
+        for ma_name in MA_NAMES:
+            rows = found.get((g, ma_name))
+            if rows:
+                rows.sort(key=lambda r: r["ticker"])
+                send_table(f"{now:%b} {now.day} | Intraday Touch of {ma_name} | {GROUP_LABEL.get(g, g)}", rows)
+
+    if scanned < len(meta) * 0.5:
+        post(f"⚠️ MA 스캐너: 시세를 {scanned}/{len(meta)}종목만 받았습니다. 일시적 오류일 수 있습니다.")
+    if FORCE:
+        post(f"✅ MA 스캐너 테스트 완료: {scanned}종목 확인, 터치 {total}건 (최근 거래일 기준)")
+    else:
+        sent_file.write_text(json.dumps(sorted(sent)))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

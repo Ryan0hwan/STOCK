@@ -20,6 +20,7 @@ import requests
 GROUPS = os.environ.get("SCAN_GROUPS", "sp500,russell2000,watchlist").split(",")
 TOL_PCT = float(os.environ.get("TOL_PCT", "1.0"))      # 터치 허용 오차(%). 선의 ±1% 안에 들어오면 터치로 봄
 ONLY_FROM_ABOVE = os.environ.get("ONLY_FROM_ABOVE", "0") == "1"  # 1이면 전일 종가가 선 위에 있던 종목만 (눌림목). 0이면 양방향 모두
+REQUIRE_GOLDEN = os.environ.get("REQUIRE_GOLDEN", "1") == "1"   # 1이면 정배열(50일 SMA > 200일 SMA) 종목만 알림
 MIN_PRICE = float(os.environ.get("MIN_PRICE", "5"))    # 이 가격 미만 종목 제외
 MIN_DOLLAR_VOL = float(os.environ.get("MIN_DOLLAR_VOL", "5000000"))  # 50일 평균 거래대금($) 하한
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
@@ -119,6 +120,10 @@ def check_touches(df: pd.DataFrame, today: dt.date | None) -> list[dict]:
         "200D SMA": c.rolling(200).mean().iloc[-1],
         "100D VWMA": ((c * v).rolling(100).sum() / v.rolling(100).sum()).iloc[-1],
     }
+    if REQUIRE_GOLDEN:  # 정배열이 아니거나 상장 200일 미만(200일선 없음)이면 제외
+        s50, s200 = mas["50D SMA"], mas["200D SMA"]
+        if pd.isna(s50) or pd.isna(s200) or not s50 > s200:
+            return []
     tol = TOL_PCT / 100
     out = []
     for name, ma in mas.items():

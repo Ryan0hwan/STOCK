@@ -1,25 +1,36 @@
 name: MA Touch Scanner
 
 on:
+  schedule:
+    - cron: "5 13-21 * * 1-5"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "장 시간이 아니어도 실행 (테스트용)"
+        type: boolean
+        default: true
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.12"
+          cache: pip
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+      - run: pip install -r requirements.txt
 
-      - name: Run scanner
+      - uses: actions/cache@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - run: python scanner.py
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python scanner.py
+          FORCE: ${{ inputs.force && '1' || '0' }}

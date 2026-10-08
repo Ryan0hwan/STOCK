@@ -5,6 +5,7 @@ MA 터치 스캐너
 - 디스코드 채널로 표 형태로 보냅니다.
 """
 import datetime as dt
+import re
 import io
 import json
 import os
@@ -17,7 +18,7 @@ import pandas as pd
 import requests
 
 # ───────────── 설정 (여기만 고치면 됩니다) ─────────────
-GROUPS = os.environ.get("SCAN_GROUPS", "sp500,nasdaq100,russell2000,watchlist").split(",")  # 앞 그룹 우선 (겹치는 종목은 앞 그룹에만 표시)
+GROUPS = os.environ.get("SCAN_GROUPS", "sp500,watchlist").split(",")  # 앞 그룹 우선 (겹치는 종목은 앞 그룹에만 표시)
 TOL_PCT = float(os.environ.get("TOL_PCT", "0.5"))      # 터치 허용 오차(%). 선의 ±0.5% 안에 들어오면 터치로 봄
 ONLY_FROM_ABOVE = os.environ.get("ONLY_FROM_ABOVE", "0") == "1"  # 1이면 전일 종가가 선 위에 있던 종목만 (눌림목). 0이면 양방향 모두
 REQUIRE_GOLDEN = os.environ.get("REQUIRE_GOLDEN", "1") == "1"   # 1이면 정배열(50일 SMA > 200일 SMA) 종목만 알림
@@ -85,9 +86,12 @@ def _load_watchlist() -> pd.DataFrame:
     if p.exists():
         for ln in p.read_text(encoding="utf-8").splitlines():
             ln = ln.split("#")[0].strip()
-            if ln:
-                rows.append({"ticker": ln, "name": "", "industry": ""})
-    return pd.DataFrame(rows, columns=["ticker", "name", "industry"])
+            if not ln:
+                continue
+            tk, _, name = ln.partition(",")          # "티커, 회사명" 형식 (회사명은 생략 가능)
+            tk = re.sub(r"\.([A-Z])$", r"-\1", tk.strip().upper())  # MOG.A → MOG-A (야후 표기)
+            rows.append({"ticker": tk, "name": name.strip(), "industry": "Watchlist"})
+    return pd.DataFrame(rows, columns=["ticker", "name", "industry"]).drop_duplicates("ticker")
 
 
 def load_universe(group: str) -> pd.DataFrame:

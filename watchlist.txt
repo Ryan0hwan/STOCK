@@ -1,6 +1,37 @@
-# 내 관심종목 (한 줄에 하나, 야후 파이낸스 티커 형식)
-# 지수에 없는 종목도 여기에 넣으면 같이 감시합니다.
-# 예시:
-# NVDA
-# ANET
-# 005930.KS   (한국 종목은 장 시간이 달라 현재 설정으로는 감시되지 않습니다)
+# 내 관심종목 — S&P 500과 똑같은 조건으로 감시합니다.
+# 형식: 티커, 회사명   (한 줄에 하나, 회사명은 생략 가능, # 뒤는 메모)
+# 클래스 주식은 점으로 적어도 됩니다 (MOG.A → 자동으로 MOG-A 변환)
+
+# ── Nasdaq 100 (S&P 500에 없는 종목) ──
+SPCX, SpaceX
+ASML, ASML
+ARM, Arm Holdings
+SHOP, Shopify
+PDD, PDD Holdings
+MELI, MercadoLibre
+ALAB, Astera Labs
+NBIS, Nebius Group
+MSTR, Strategy
+CRWV, CoreWeave
+RKLB, Rocket Lab
+CCEP, Coca-Cola Europacific Partners
+TRI, Thomson Reuters
+FER, Ferrovial
+ALNY, Alnylam Pharmaceuticals
+
+# ── Russell 2000 ──
+TWST, Twist Bioscience
+FROG, JFrog
+MOG.A, Moog
+BTSG, BrightSpring Health
+VSAT, Viasat
+MXL, MaxLinear
+HUT, Hut 8
+TXG, 10x Genomics
+GKOS, Glaukos
+PCVX, Vaxcyte
+SM, SM Energy
+EAT, Brinker
+CYTK, Cytokinetics
+PBF, PBF Energy
+OSCR, Oscar Health

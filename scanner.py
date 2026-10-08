@@ -1,7 +1,7 @@
 """
 MA 터치 스캐너
-- S&P 500 / Russell 2000 / 내 관심종목을 훑어서
-- 당일 가격 범위가 50일 SMA, 200일 SMA, 100일 VWMA에 닿은 종목을
+- S&P 500 / Nasdaq 100 / Russell 2000(대형·고유동성만) / 내 관심종목을 훑어서
+- 당일 가격 범위가 50일 SMA, 100일 VWMA, 200일 SMA, 325일 SMA에 닿은 종목을
 - 디스코드 채널로 표 형태로 보냅니다.
 """
 import datetime as dt
@@ -17,7 +17,7 @@ import pandas as pd
 import requests
 
 # ───────────── 설정 (여기만 고치면 됩니다) ─────────────
-GROUPS = os.environ.get("SCAN_GROUPS", "sp500,russell2000,watchlist").split(",")
+GROUPS = os.environ.get("SCAN_GROUPS", "sp500,nasdaq100,russell2000,watchlist").split(",")  # 앞 그룹 우선 (겹치는 종목은 앞 그룹에만 표시)
 TOL_PCT = float(os.environ.get("TOL_PCT", "0.5"))      # 터치 허용 오차(%). 선의 ±0.5% 안에 들어오면 터치로 봄
 ONLY_FROM_ABOVE = os.environ.get("ONLY_FROM_ABOVE", "0") == "1"  # 1이면 전일 종가가 선 위에 있던 종목만 (눌림목). 0이면 양방향 모두
 REQUIRE_GOLDEN = os.environ.get("REQUIRE_GOLDEN", "1") == "1"   # 1이면 정배열(50일 SMA > 200일 SMA) 종목만 알림
@@ -26,7 +26,9 @@ FIRST_TOUCH_DAYS = int(os.environ.get("FIRST_TOUCH_DAYS", "20"))  # 위에서 �
 REQUIRE_SLOPE = os.environ.get("REQUIRE_SLOPE", "1") == "1"      # 1이면 50일선(20일 전 대비)·200일선(1개월 전 대비)이 모두 상승 중인 종목만
 REQUIRE_RS = os.environ.get("REQUIRE_RS", "1") == "1"            # 1이면 최근 3개월·6개월 수익률이 모두 S&P 500(SPY)보다 높은 종목만
 MIN_PRICE = float(os.environ.get("MIN_PRICE", "5"))    # 이 가격 미만 종목 제외
-MIN_DOLLAR_VOL = float(os.environ.get("MIN_DOLLAR_VOL", "5000000"))  # 50일 평균 거래대금($) 하한
+MIN_DOLLAR_VOL = float(os.environ.get("MIN_DOLLAR_VOL", "5000000"))  # 50일 평균 거래대금($) 하한 (전체 공통)
+RUSSELL_MIN_DOLLAR_VOL = float(os.environ.get("RUSSELL_MIN_DOLLAR_VOL", "50000000"))  # Russell 2000 종목: 50일 평균 거래대금 $50M 이상만
+RUSSELL_MIN_MCAP = float(os.environ.get("RUSSELL_MIN_MCAP", "2000000000"))            # Russell 2000 종목: 시가총액 $2B 이상만
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
 FORCE = os.environ.get("FORCE", "0") == "1"            # 장 시간이 아니어도 강제 실행
 # ──────────────────────────────────────────────────────
@@ -35,8 +37,10 @@ NY = ZoneInfo("America/New_York")
 STATE = Path(__file__).parent / "state"
 STATE.mkdir(exist_ok=True)
 UA = {"User-Agent": "Mozilla/5.0 (ma-touch-scanner)"}
-GROUP_LABEL = {"sp500": "S&P 500", "russell2000": "Russell 2000", "watchlist": "Watchlist"}
-MA_NAMES = ["50D SMA", "200D SMA", "100D VWMA"]
+GROUP_LABEL = {"sp500": "S&P 500", "nasdaq100": "Nasdaq 100", "russell2000": "Russell 2000", "watchlist": "Watchlist"}
+MA_NAMES = ["50D SMA", "100D VWMA", "200D SMA", "325D SMA"]
+BROWSER_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"}
 
 
 # ───────────── 종목 목록 ─────────────
@@ -47,14 +51,31 @@ def _fetch_sp500() -> pd.DataFrame:
     return pd.DataFrame({"ticker": t["Symbol"], "name": t["Security"], "industry": t["GICS Sub-Industry"]})
 
 
+def _fetch_nasdaq100() -> pd.DataFrame:
+    url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+    html = requests.get(url, headers=UA, timeout=30).text
+    for t in pd.read_html(io.StringIO(html)):
+        cols = {str(c).strip().lower(): c for c in t.columns}
+        tk = cols.get("ticker") or cols.get("symbol")
+        if tk is not None and 90 <= len(t) <= 110:
+            name = cols.get("company") or cols.get("security") or tk
+            ind = cols.get("gics sub-industry") or cols.get("gics sector") or cols.get("industry")
+            return pd.DataFrame({"ticker": t[tk], "name": t[name],
+                                 "industry": t[ind] if ind is not None else ""})
+    raise ValueError("Nasdaq-100 구성종목 표를 찾지 못함")
+
+
 def _fetch_russell2000() -> pd.DataFrame:
     url = ("https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/"
            "1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund")
-    text = requests.get(url, headers=UA, timeout=60).text
-    lines = text.splitlines()
-    start = next(i for i, ln in enumerate(lines) if ln.startswith("Ticker,"))
-    t = pd.read_csv(io.StringIO("\n".join(lines[start:])))
-    t = t[t["Asset Class"] == "Equity"]
+    r = requests.get(url, headers=BROWSER_UA, timeout=60)
+    r.raise_for_status()
+    lines = r.content.decode("utf-8-sig", errors="replace").splitlines()
+    # 앞쪽 펀드 설명, 뒤쪽 면책 문구를 건너뛰고 종목 표만 읽음
+    start = next(i for i, ln in enumerate(lines) if ln.replace('"', "").startswith("Ticker,"))
+    t = pd.read_csv(io.StringIO("\n".join(lines[start:])), on_bad_lines="skip", dtype=str)
+    t.columns = [c.strip() for c in t.columns]
+    t = t[t["Asset Class"].astype(str).str.strip() == "Equity"]
     return pd.DataFrame({"ticker": t["Ticker"], "name": t["Name"], "industry": t["Sector"]})
 
 
@@ -76,7 +97,7 @@ def load_universe(group: str) -> pd.DataFrame:
     fresh = cache.exists() and (time.time() - cache.stat().st_mtime) < 7 * 86400
     if not fresh:
         try:
-            df = {"sp500": _fetch_sp500, "russell2000": _fetch_russell2000}[group]()
+            df = {"sp500": _fetch_sp500, "nasdaq100": _fetch_nasdaq100, "russell2000": _fetch_russell2000}[group]()
             if len(df) < 50:
                 raise ValueError("종목 수가 비정상적으로 적음")
             df.to_csv(cache, index=False)
@@ -96,7 +117,7 @@ def download(tickers: list[str]):
     for i in range(0, len(tickers), 200):
         chunk = tickers[i:i + 200]
         try:
-            data = yf.download(chunk, period="1y", interval="1d", group_by="ticker",
+            data = yf.download(chunk, period="2y", interval="1d", group_by="ticker",
                                auto_adjust=False, threads=True, progress=False)
         except Exception as e:
             print(f"[경고] 시세 다운로드 실패({chunk[0]}…): {e}")
@@ -110,19 +131,21 @@ def download(tickers: list[str]):
         time.sleep(1)
 
 
-def check_touches(df: pd.DataFrame, today: dt.date | None, spy_ret: dict | None = None) -> list[dict]:
+def check_touches(df: pd.DataFrame, today: dt.date | None, spy_ret: dict | None = None,
+                  min_dollar_vol: float = MIN_DOLLAR_VOL) -> list[dict]:
     """한 종목의 일봉에서 오늘 조건을 통과한 터치를 반환 (today가 None이면 가장 최근 거래일 기준)"""
     df = df.dropna(subset=["Close", "High", "Low", "Volume"])
     if len(df) < 60 or (today is not None and df.index[-1].date() != today):
         return []
     c, v = df["Close"], df["Volume"]
     last, prev = df.iloc[-1], df.iloc[-2]
-    if last["Close"] < MIN_PRICE or (c * v).tail(50).mean() < MIN_DOLLAR_VOL:
+    if last["Close"] < MIN_PRICE or (c * v).tail(50).mean() < max(MIN_DOLLAR_VOL, min_dollar_vol):
         return []
     series = {
         "50D SMA": c.rolling(50).mean(),
-        "200D SMA": c.rolling(200).mean(),
         "100D VWMA": (c * v).rolling(100).sum() / v.rolling(100).sum(),
+        "200D SMA": c.rolling(200).mean(),
+        "325D SMA": c.rolling(325).mean(),   # 상장 325거래일 미만이면 이 선만 건너뜀
     }
     mas = {k: s.iloc[-1] for k, s in series.items()}
     s50, s200 = series["50D SMA"], series["200D SMA"]
@@ -170,6 +193,31 @@ def check_touches(df: pd.DataFrame, today: dt.date | None, spy_ret: dict | None 
                 continue
         out.append({"ma_name": name, "ma": float(ma), "low": float(last["Low"]), "last": float(last["Close"])})
     return out
+
+
+def market_cap(ticker: str, price: float) -> float | None:
+    """상장주식수 × 현재가. 주식수는 7일간 캐시. 조회 실패 시 None"""
+    cache_file = STATE / "shares.json"
+    try:
+        cache = json.loads(cache_file.read_text()) if cache_file.exists() else {}
+    except Exception:
+        cache = {}
+    hit = cache.get(ticker)
+    if hit and time.time() - hit["ts"] < 7 * 86400:
+        return hit["shares"] * price
+    try:
+        import yfinance as yf
+        fi = yf.Ticker(ticker).fast_info
+        shares = fi.get("shares") if hasattr(fi, "get") else getattr(fi, "shares", None)
+        if not shares:
+            mc = fi.get("marketCap") if hasattr(fi, "get") else getattr(fi, "market_cap", None)
+            return float(mc) if mc else None
+        cache[ticker] = {"shares": float(shares), "ts": time.time()}
+        cache_file.write_text(json.dumps(cache))
+        return float(shares) * price
+    except Exception as e:
+        print(f"[경고] {ticker} 시가총액 조회 실패: {e}")
+        return None
 
 
 # ───────────── 디스코드 ─────────────
@@ -228,7 +276,10 @@ def main():
             if row.ticker not in meta:          # 여러 그룹에 있으면 먼저 나온 그룹으로 분류
                 meta[row.ticker] = row
                 group_of[row.ticker] = g
-    print(f"스캔 대상 {len(meta)}종목")
+    print(f"스캔 대상 {len(meta)}종목 " + ", ".join(f"{g}={len(u)}" for g, u in universes.items()))
+    failed = [GROUP_LABEL.get(g, g) for g, u in universes.items() if g != "watchlist" and len(u) == 0]
+    if failed and meta:
+        post(f"⚠️ MA 스캐너: {', '.join(failed)} 종목 목록을 불러오지 못해 이번 실행에서 빠졌습니다.")
     if not meta:
         post("⚠️ MA 스캐너: 종목 목록을 불러오지 못했습니다. Actions 로그를 확인하세요.")
         return
@@ -247,7 +298,14 @@ def main():
     scanned = 0
     for ticker, df in download(list(meta)):
         scanned += 1
-        for t in check_touches(df, None if FORCE else today, spy_ret):  # 테스트 실행은 최근 거래일 기준
+        is_russell = group_of[ticker] == "russell2000"
+        touches = check_touches(df, None if FORCE else today, spy_ret,
+                                RUSSELL_MIN_DOLLAR_VOL if is_russell else MIN_DOLLAR_VOL)
+        if touches and is_russell:  # Russell 종목은 알림 후보일 때만 시가총액 확인 (조회 실패 시 통과)
+            mc = market_cap(ticker, touches[0]["last"])
+            if mc is not None and mc < RUSSELL_MIN_MCAP:
+                touches = []
+        for t in touches:  # 테스트 실행은 최근 거래일 기준
             key = f"{ticker}|{t['ma_name']}"
             if key in sent:
                 continue

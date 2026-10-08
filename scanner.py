@@ -18,9 +18,13 @@ import requests
 
 # ───────────── 설정 (여기만 고치면 됩니다) ─────────────
 GROUPS = os.environ.get("SCAN_GROUPS", "sp500,russell2000,watchlist").split(",")
-TOL_PCT = float(os.environ.get("TOL_PCT", "1.0"))      # 터치 허용 오차(%). 선의 ±1% 안에 들어오면 터치로 봄
+TOL_PCT = float(os.environ.get("TOL_PCT", "0.5"))      # 터치 허용 오차(%). 선의 ±0.5% 안에 들어오면 터치로 봄
 ONLY_FROM_ABOVE = os.environ.get("ONLY_FROM_ABOVE", "0") == "1"  # 1이면 전일 종가가 선 위에 있던 종목만 (눌림목). 0이면 양방향 모두
 REQUIRE_GOLDEN = os.environ.get("REQUIRE_GOLDEN", "1") == "1"   # 1이면 정배열(50일 SMA > 200일 SMA) 종목만 알림
+REQUIRE_CLOSE_ABOVE = os.environ.get("REQUIRE_CLOSE_ABOVE", "1") == "1"  # 1이면 종가가 터치한 선 위에서 마감한 경우만
+FIRST_TOUCH_DAYS = int(os.environ.get("FIRST_TOUCH_DAYS", "20"))  # 위에서 내려온 터치는 최근 N일간 종가가 그 선 아래로 간 적 없어야 함 (0이면 해제)
+REQUIRE_SLOPE = os.environ.get("REQUIRE_SLOPE", "1") == "1"      # 1이면 50일선(20일 전 대비)·200일선(1개월 전 대비)이 모두 상승 중인 종목만
+REQUIRE_RS = os.environ.get("REQUIRE_RS", "1") == "1"            # 1이면 최근 3개월·6개월 수익률이 모두 S&P 500(SPY)보다 높은 종목만
 MIN_PRICE = float(os.environ.get("MIN_PRICE", "5"))    # 이 가격 미만 종목 제외
 MIN_DOLLAR_VOL = float(os.environ.get("MIN_DOLLAR_VOL", "5000000"))  # 50일 평균 거래대금($) 하한
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
@@ -106,8 +110,8 @@ def download(tickers: list[str]):
         time.sleep(1)
 
 
-def check_touches(df: pd.DataFrame, today: dt.date | None) -> list[dict]:
-    """한 종목의 일봉에서 오늘 터치한 선들을 반환 (today가 None이면 가장 최근 거래일 기준)"""
+def check_touches(df: pd.DataFrame, today: dt.date | None, spy_ret: dict | None = None) -> list[dict]:
+    """한 종목의 일봉에서 오늘 조건을 통과한 터치를 반환 (today가 None이면 가장 최근 거래일 기준)"""
     df = df.dropna(subset=["Close", "High", "Low", "Volume"])
     if len(df) < 60 or (today is not None and df.index[-1].date() != today):
         return []
@@ -115,23 +119,56 @@ def check_touches(df: pd.DataFrame, today: dt.date | None) -> list[dict]:
     last, prev = df.iloc[-1], df.iloc[-2]
     if last["Close"] < MIN_PRICE or (c * v).tail(50).mean() < MIN_DOLLAR_VOL:
         return []
-    mas = {
-        "50D SMA": c.rolling(50).mean().iloc[-1],
-        "200D SMA": c.rolling(200).mean().iloc[-1],
-        "100D VWMA": ((c * v).rolling(100).sum() / v.rolling(100).sum()).iloc[-1],
+    series = {
+        "50D SMA": c.rolling(50).mean(),
+        "200D SMA": c.rolling(200).mean(),
+        "100D VWMA": (c * v).rolling(100).sum() / v.rolling(100).sum(),
     }
-    if REQUIRE_GOLDEN:  # 정배열이 아니거나 상장 200일 미만(200일선 없음)이면 제외
-        s50, s200 = mas["50D SMA"], mas["200D SMA"]
-        if pd.isna(s50) or pd.isna(s200) or not s50 > s200:
+    mas = {k: s.iloc[-1] for k, s in series.items()}
+    s50, s200 = series["50D SMA"], series["200D SMA"]
+
+    # 정배열: 50일선 > 200일선 (200일선이 없으면 제외)
+    if REQUIRE_GOLDEN and (pd.isna(mas["50D SMA"]) or pd.isna(mas["200D SMA"]) or not mas["50D SMA"] > mas["200D SMA"]):
+        return []
+
+    # 이평선 기울기: 50일선은 20거래일 전보다, 200일선은 21거래일(약 1개월) 전보다 높아야 함
+    if REQUIRE_SLOPE:
+        if len(df) < 222:
             return []
+        a50, b50, a200, b200 = s50.iloc[-1], s50.iloc[-21], s200.iloc[-1], s200.iloc[-22]
+        if pd.isna(b50) or pd.isna(b200) or not (a50 > b50 and a200 > b200):
+            return []
+
+    # 상대강도: 3개월(63일)·6개월(126일) 수익률이 모두 SPY보다 높아야 함
+    if REQUIRE_RS and spy_ret:
+        if len(c) < 127:
+            return []
+        r3, r6 = c.iloc[-1] / c.iloc[-64] - 1, c.iloc[-1] / c.iloc[-127] - 1
+        if not (r3 > spy_ret["3m"] and r6 > spy_ret["6m"]):
+            return []
+
     tol = TOL_PCT / 100
     out = []
     for name, ma in mas.items():
         if pd.isna(ma):
             continue
         touched = last["Low"] <= ma * (1 + tol) and last["High"] >= ma * (1 - tol)
-        if touched and (not ONLY_FROM_ABOVE or prev["Close"] > ma):
-            out.append({"ma_name": name, "ma": float(ma), "low": float(last["Low"]), "last": float(last["Close"])})
+        if not touched:
+            continue
+        from_above = prev["Close"] > ma
+        if ONLY_FROM_ABOVE and not from_above:
+            continue
+        # 선 위에서 마감
+        if REQUIRE_CLOSE_ABOVE and not last["Close"] > ma:
+            continue
+        # 첫 번째 터치: 위에서 내려온 경우, 오늘 이전 N일 동안 종가가 그 선 아래로 간 적 없어야 함
+        # (아래에서 올라온 '회복' 터치에는 적용하지 않음 — 정의상 전일 종가가 선 아래이기 때문)
+        if FIRST_TOUCH_DAYS > 0 and from_above:
+            past_c = c.iloc[-1 - FIRST_TOUCH_DAYS:-1]
+            past_ma = series[name].iloc[-1 - FIRST_TOUCH_DAYS:-1]
+            if past_ma.isna().any() or (past_c <= past_ma).any():
+                continue
+        out.append({"ma_name": name, "ma": float(ma), "low": float(last["Low"]), "last": float(last["Close"])})
     return out
 
 
@@ -171,7 +208,7 @@ def send_table(title: str, rows: list[dict]):
 # ───────────── 실행 ─────────────
 def main():
     now = dt.datetime.now(NY)
-    is_open = now.weekday() < 5 and dt.time(9, 35) <= now.time() <= dt.time(16, 30)
+    is_open = now.weekday() < 5 and dt.time(9, 35) <= now.time() <= dt.time(17, 30)  # 장 마감 직후 실행분까지 포함
     if not is_open and not FORCE:
         print(f"장 시간이 아님 ({now:%Y-%m-%d %H:%M} ET). 종료.")
         return
@@ -196,11 +233,21 @@ def main():
         post("⚠️ MA 스캐너: 종목 목록을 불러오지 못했습니다. Actions 로그를 확인하세요.")
         return
 
+    # 상대강도 비교용 SPY 수익률
+    spy_ret = None
+    if REQUIRE_RS:
+        for _, sdf in download(["SPY"]):
+            sc = sdf["Close"].dropna()
+            if len(sc) >= 127:
+                spy_ret = {"3m": sc.iloc[-1] / sc.iloc[-64] - 1, "6m": sc.iloc[-1] / sc.iloc[-127] - 1}
+        if spy_ret is None:
+            print("[경고] SPY 시세를 받지 못해 이번 실행은 상대강도 조건을 건너뜁니다.")
+
     found: dict[tuple, list] = {}
     scanned = 0
     for ticker, df in download(list(meta)):
         scanned += 1
-        for t in check_touches(df, None if FORCE else today):  # 테스트 실행은 최근 거래일 기준
+        for t in check_touches(df, None if FORCE else today, spy_ret):  # 테스트 실행은 최근 거래일 기준
             key = f"{ticker}|{t['ma_name']}"
             if key in sent:
                 continue

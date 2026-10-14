@@ -19,7 +19,7 @@ import requests
 
 # ───────────── 설정 (여기만 고치면 됩니다) ─────────────
 GROUPS = os.environ.get("SCAN_GROUPS", "sp500,watchlist").split(",")  # 앞 그룹 우선 (겹치는 종목은 앞 그룹에만 표시)
-TOL_PCT = float(os.environ.get("TOL_PCT", "0.5"))      # 터치 허용 오차(%). 선의 ±0.5% 안에 들어오면 터치로 봄
+TOL_PCT = float(os.environ.get("TOL_PCT", "0.8"))      # 터치 허용 오차(%). 선의 ±0.8% 안에 들어오면 터치로 봄
 ONLY_FROM_ABOVE = os.environ.get("ONLY_FROM_ABOVE", "0") == "1"  # 1이면 전일 종가가 선 위에 있던 종목만 (눌림목). 0이면 양방향 모두
 REQUIRE_GOLDEN = os.environ.get("REQUIRE_GOLDEN", "1") == "1"   # 1이면 정배열(50일 SMA > 200일 SMA) 종목만 알림
 REQUIRE_CLOSE_ABOVE = os.environ.get("REQUIRE_CLOSE_ABOVE", "1") == "1"  # 1이면 종가가 터치한 선 위에서 마감한 경우만
@@ -224,6 +224,26 @@ def market_cap(ticker: str, price: float) -> float | None:
         return None
 
 
+def company_name(ticker: str) -> str:
+    """관심종목에 회사명이 없을 때 알림 표시용으로만 조회. 실패하면 빈 칸"""
+    cache_file = STATE / "names.json"
+    try:
+        cache = json.loads(cache_file.read_text()) if cache_file.exists() else {}
+    except Exception:
+        cache = {}
+    if ticker in cache:
+        return cache[ticker]
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info
+        name = info.get("shortName") or info.get("longName") or ""
+    except Exception:
+        name = ""
+    cache[ticker] = name
+    cache_file.write_text(json.dumps(cache))
+    return name
+
+
 # ───────────── 디스코드 ─────────────
 def post(content: str):
     if not WEBHOOK:
@@ -315,8 +335,9 @@ def main():
                 continue
             sent.add(key)
             m = meta[ticker]
+            name = str(m.name) or company_name(ticker)
             found.setdefault((group_of[ticker], t["ma_name"]), []).append(
-                {"time": f"{now:%H:%M}", "ticker": ticker, "name": str(m.name), "industry": str(m.industry), **t})
+                {"time": f"{now:%H:%M}", "ticker": ticker, "name": name, "industry": str(m.industry), **t})
 
     total = sum(len(v) for v in found.values())
     print(f"시세 확인 {scanned}종목, 신규 터치 {total}건")

@@ -30,6 +30,15 @@ MIN_PRICE = float(os.environ.get("MIN_PRICE", "5"))    # 이 가격 미만 종�
 MIN_DOLLAR_VOL = float(os.environ.get("MIN_DOLLAR_VOL", "5000000"))  # 50일 평균 거래대금($) 하한 (전체 공통)
 RUSSELL_MIN_DOLLAR_VOL = float(os.environ.get("RUSSELL_MIN_DOLLAR_VOL", "50000000"))  # Russell 2000 종목: 50일 평균 거래대금 $50M 이상만
 RUSSELL_MIN_MCAP = float(os.environ.get("RUSSELL_MIN_MCAP", "2000000000"))            # Russell 2000 종목: 시가총액 $2B 이상만
+# ── [확률높은종목] 강화 조건 (기존 알림은 그대로, 아래 3개를 모두 통과한 종목만 따로 표시) ──
+HP_ENABLE = os.environ.get("HP_ENABLE", "1") == "1"
+HP_VOL_MAX = float(os.environ.get("HP_VOL_MAX", "0.8"))          # ① 터치한 날 거래량 < 50일 평균 × 0.8 (장중엔 경과 시간 비율로 환산)
+HP_PIVOT_LOOKBACK = int(os.environ.get("HP_PIVOT_LOOKBACK", "40"))  # ① 눌림 시작점(최근 고점)을 찾는 기간(거래일)
+HP_RALLY_DAYS = int(os.environ.get("HP_RALLY_DAYS", "20"))       # ① 고점 직전 상승 구간 길이(거래일) — 눌림 평균 거래량이 이보다 적어야 함
+HP_NEAR_HIGH = float(os.environ.get("HP_NEAR_HIGH", "25"))       # ② 52주 고점 대비 -25% 이내
+HP_RUNUP = float(os.environ.get("HP_RUNUP", "20"))               # ② 최근 3개월 안에 저점→고점 +20% 이상 상승한 이력
+HP_RUNUP_DAYS = int(os.environ.get("HP_RUNUP_DAYS", "63"))
+# ③ 강화된 정배열: 50일선 > 150일선 > 200일선 (항상 적용)
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
 FORCE = os.environ.get("FORCE", "0") == "1"            # 장 시간이 아니어도 강제 실행
 # ──────────────────────────────────────────────────────
@@ -135,8 +144,42 @@ def download(tickers: list[str]):
         time.sleep(1)
 
 
+def high_prob(df: pd.DataFrame, frac: float) -> dict:
+    """[확률높은종목] 조건 3개 판정. 반환: {"ok": bool, 표시용 수치...}"""
+    c, v, h = df["Close"], df["Volume"], df["High"]
+    res = {"ok": False, "vol_pct": float("nan"), "pull_vs_rally": float("nan"),
+           "from_high": float("nan"), "runup": float("nan")}
+    if len(df) < max(252, HP_PIVOT_LOOKBACK + HP_RALLY_DAYS + 2):
+        return res
+    # ③ 강화된 정배열 50 > 150 > 200
+    s50, s150, s200 = (c.rolling(n).mean().iloc[-1] for n in (50, 150, 200))
+    align = s50 > s150 > s200
+
+    # ① 거래량 감소: 오늘(장중이면 하루치로 환산) < 50일 평균 × 0.8, 눌림 평균 < 직전 상승 구간 평균
+    avg50 = v.iloc[-51:-1].mean()
+    today_full = v.iloc[-1] / max(frac, 0.05)
+    vol_pct = today_full / avg50 * 100 if avg50 else float("nan")
+    win = h.iloc[-1 - HP_PIVOT_LOOKBACK:-1]
+    hi_pos = len(df) - 1 - HP_PIVOT_LOOKBACK + int(win.values.argmax())   # 눌림 시작점(최근 고점) 위치
+    pull = v.iloc[hi_pos + 1:-1]                                          # 고점 다음날 ~ 어제
+    pull_avg = pull.mean() if len(pull) else today_full
+    rally_avg = v.iloc[max(0, hi_pos - HP_RALLY_DAYS + 1):hi_pos + 1].mean()
+    pull_vs_rally = pull_avg / rally_avg * 100 if rally_avg else float("nan")
+    vol_ok = vol_pct < HP_VOL_MAX * 100 and pull_vs_rally < 100
+
+    # ② 주도주: 52주 고점 -25% 이내 + 최근 3개월 안에 +20% 이상 상승 이력
+    from_high = (c.iloc[-1] / h.tail(252).max() - 1) * 100
+    w = c.tail(HP_RUNUP_DAYS)
+    runup = float(((w / w.cummin()) - 1).max() * 100)
+    lead_ok = from_high >= -HP_NEAR_HIGH and runup >= HP_RUNUP
+
+    res.update(ok=bool(align and vol_ok and lead_ok), vol_pct=float(vol_pct), pull_vs_rally=float(pull_vs_rally),
+               from_high=float(from_high), runup=runup)
+    return res
+
+
 def check_touches(df: pd.DataFrame, today: dt.date | None, spy_ret: dict | None = None,
-                  min_dollar_vol: float = MIN_DOLLAR_VOL) -> list[dict]:
+                  min_dollar_vol: float = MIN_DOLLAR_VOL, frac: float = 1.0) -> list[dict]:
     """한 종목의 일봉에서 오늘 조건을 통과한 터치를 반환 (today가 None이면 가장 최근 거래일 기준)"""
     df = df.dropna(subset=["Close", "High", "Low", "Volume"])
     if len(df) < 60 or (today is not None and df.index[-1].date() != today):
@@ -175,6 +218,7 @@ def check_touches(df: pd.DataFrame, today: dt.date | None, spy_ret: dict | None 
             return []
 
     tol = TOL_PCT / 100
+    hp = high_prob(df, frac) if HP_ENABLE else {"ok": False}
     out = []
     for name, ma in mas.items():
         if pd.isna(ma):
@@ -195,7 +239,8 @@ def check_touches(df: pd.DataFrame, today: dt.date | None, spy_ret: dict | None 
             past_ma = series[name].iloc[-1 - FIRST_TOUCH_DAYS:-1]
             if past_ma.isna().any() or (past_c <= past_ma).any():
                 continue
-        out.append({"ma_name": name, "ma": float(ma), "low": float(last["Low"]), "last": float(last["Close"])})
+        out.append({"ma_name": name, "ma": float(ma), "low": float(last["Low"]), "last": float(last["Close"]),
+                    "hp": hp["ok"] and from_above, "hpd": hp})   # 확률높은종목은 위에서 내려온 '눌림' 터치만
     return out
 
 
@@ -277,6 +322,28 @@ def send_table(title: str, rows: list[dict]):
         first = False
 
 
+def send_hp_table(title: str, rows: list[dict]):
+    head = f"{'TICKER':<8}{'MA':<11}{'LAST':>9}{'HIGH%':>8}{'RUNUP%':>8}{'VOL%':>7}{'PULL%':>7}  DESCRIPTION"
+    lines = [
+        f"{r['ticker']:<8}{r['ma_name']:<11}{r['last']:>9.2f}{r['hpd']['from_high']:>8.1f}{r['hpd']['runup']:>8.1f}"
+        f"{r['hpd']['vol_pct']:>7.0f}{r['hpd']['pull_vs_rally']:>7.0f}  {r['name'][:24]}"
+        for r in rows
+    ]
+    first = True
+    while lines:
+        block, size = [], 0
+        while lines and size + len(lines[0]) + 1 < 1700:
+            size += len(lines[0]) + 1
+            block.append(lines.pop(0))
+        header = f"**{title}**\n" if first else ""
+        post(f"{header}```\n{head}\n" + "\n".join(block) + "\n```")
+        first = False
+    post("HIGH% = 52주 고점 대비 · RUNUP% = 최근 3개월 최대 상승폭 · VOL% = 오늘 거래량 ÷ 50일 평균"
+         " (장중은 하루치로 환산) · PULL% = 눌림 구간 평균 거래량 ÷ 직전 상승 구간 평균\n"
+         f"조건: ① VOL% < {HP_VOL_MAX * 100:.0f} 그리고 PULL% < 100 · ② HIGH% ≥ -{HP_NEAR_HIGH:.0f}, RUNUP% ≥ {HP_RUNUP:.0f}"
+         " · ③ 50일 > 150일 > 200일선 · 위에서 내려온 눌림 터치만")
+
+
 # ───────────── 실행 ─────────────
 def main():
     now = dt.datetime.now(NY)
@@ -285,6 +352,9 @@ def main():
         print(f"장 시간이 아님 ({now:%Y-%m-%d %H:%M} ET). 종료.")
         return
     today = now.date()
+    # 장중 경과 비율 (거래량 환산용). 테스트 실행·장 마감 후에는 1
+    open_t = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    frac = 1.0 if FORCE else min(max((now - open_t).total_seconds() / 60 / 390, 0.05), 1.0)
 
     # 오늘 이미 보낸 알림 (같은 종목·같은 선은 하루 1회)
     sent_file = STATE / f"sent_{today}.json"
@@ -319,25 +389,30 @@ def main():
             print("[경고] SPY 시세를 받지 못해 이번 실행은 상대강도 조건을 건너뜁니다.")
 
     found: dict[tuple, list] = {}
+    hp_rows: list[dict] = []
     scanned = 0
     for ticker, df in download(list(meta)):
         scanned += 1
         is_russell = group_of[ticker] == "russell2000"
         touches = check_touches(df, None if FORCE else today, spy_ret,
-                                RUSSELL_MIN_DOLLAR_VOL if is_russell else MIN_DOLLAR_VOL)
+                                RUSSELL_MIN_DOLLAR_VOL if is_russell else MIN_DOLLAR_VOL, frac)
         if touches and is_russell:  # Russell 종목은 알림 후보일 때만 시가총액 확인 (조회 실패 시 통과)
             mc = market_cap(ticker, touches[0]["last"])
             if mc is not None and mc < RUSSELL_MIN_MCAP:
                 touches = []
         for t in touches:  # 테스트 실행은 최근 거래일 기준
+            m = meta[ticker]
+            name = str(m.name) or company_name(ticker)
+            row = {"time": f"{now:%H:%M}", "ticker": ticker, "name": name, "industry": str(m.industry), **t}
+            hp_key = f"HP|{ticker}|{t['ma_name']}"          # 확률높은종목은 기존 알림과 별도로 하루 1회
+            if t["hp"] and hp_key not in sent:
+                sent.add(hp_key)
+                hp_rows.append(row)
             key = f"{ticker}|{t['ma_name']}"
             if key in sent:
                 continue
             sent.add(key)
-            m = meta[ticker]
-            name = str(m.name) or company_name(ticker)
-            found.setdefault((group_of[ticker], t["ma_name"]), []).append(
-                {"time": f"{now:%H:%M}", "ticker": ticker, "name": name, "industry": str(m.industry), **t})
+            found.setdefault((group_of[ticker], t["ma_name"]), []).append(row)
 
     total = sum(len(v) for v in found.values())
     print(f"시세 확인 {scanned}종목, 신규 터치 {total}건")
@@ -348,10 +423,16 @@ def main():
                 rows.sort(key=lambda r: r["ticker"])
                 send_table(f"{now:%b} {now.day} | Intraday Touch of {ma_name} | {GROUP_LABEL.get(g, g)}", rows)
 
+    if HP_ENABLE and hp_rows:
+        hp_rows.sort(key=lambda r: (MA_NAMES.index(r["ma_name"]), r["hpd"]["vol_pct"]))
+        send_hp_table(f"⭐ [확률높은종목] {now:%b} {now.day} | 거래량 감소 눌림 · 주도주 · 50>150>200 정배열 ({len(hp_rows)})", hp_rows)
+    elif HP_ENABLE and FORCE:
+        post("⭐ [확률높은종목] 이번 실행에는 조건을 모두 통과한 종목이 없습니다.")
+
     if scanned < len(meta) * 0.5:
         post(f"⚠️ MA 스캐너: 시세를 {scanned}/{len(meta)}종목만 받았습니다. 일시적 오류일 수 있습니다.")
     if FORCE:
-        post(f"✅ MA 스캐너 테스트 완료: {scanned}종목 확인, 터치 {total}건 (최근 거래일 기준)")
+        post(f"✅ MA 스캐너 테스트 완료: {scanned}종목 확인, 터치 {total}건 · 확률높은종목 {len(hp_rows)}건 (최근 거래일 기준)")
     else:
         sent_file.write_text(json.dumps(sorted(sent)))
 

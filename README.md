@@ -56,15 +56,22 @@ TEST    50D SMA        93.00    -7.5    27.9     40     30  Test Corp
 | 오랜만의 첫 터치 | 최근 6개월(월봉은 12개월) 동안 종가가 그 선 아래로 간 적 없음 |
 | 반등 캔들 | 걸러 내지 않고 표시만: 종가가 당일 범위 상위 50%면 REV `OK` |
 
+선마다 표가 따로 옵니다 (일봉 SMA325 → 주봉 VWMA100 → 월봉 VWMA100). 해당 종목이 없는 선은 생략됩니다.
+
 ```
-📉 장기 지지선 터치 Oct 27 | 고점 대비 -25% 이상 하락 종목 (1)
-TICKER  LINE              MA      LOW     LAST   HIGH%  SLOPE%  REV  NAME
-TEST    D-SMA325      112.43   112.09   113.55   -29.7    +3.9   OK  Test Corp
+📉 주봉 VWMA100 터치 Oct 27 | 고점 대비 -25% 이상 하락 (1)
+TICKER       MA    LAST  HIGH% SLOPE% REV  NAME
+GLW      119.63  127.25  -53.2   +9.1  OK  Corning Inc.
+
+📉 월봉 VWMA100 터치 Oct 27 | 고점 대비 -25% 이상 하락 (2)
+TICKER       MA    LAST  HIGH% SLOPE% REV  NAME
+KTOS      39.54   41.91  -68.7  +10.4  OK  Kratos Defense
+TMUS     145.33  146.74  -34.7   +4.5   -  T-Mobile US
 ```
 
 | 열 | 의미 |
 |---|---|
-| LINE | D-SMA325 = 일봉 325일 SMA · W-VWMA100 = 주봉 100주 VWMA · M-VWMA100 = 월봉 100개월 VWMA |
+| MA | 그 장기선의 현재 값 |
 | HIGH% | 52주 고점 대비 |
 | SLOPE% | 선의 상승률 (일봉 1개월 · 주봉 13주 · 월봉 6개월 전 대비) |
 | REV | OK = 반등 캔들 |

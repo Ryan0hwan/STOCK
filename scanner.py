@@ -420,10 +420,14 @@ def lt_check(daily: pd.DataFrame, bars: dict[str, pd.DataFrame]) -> list[dict]:
     return out
 
 
+LT_TITLE = {"D-SMA325": "일봉 SMA325", "W-VWMA100": "주봉 VWMA100", "M-VWMA100": "월봉 VWMA100"}
+
+
 def send_lt_table(title: str, rows: list[dict]):
-    head = f"{'TICKER':<8}{'LINE':<11}{'MA':>9}{'LOW':>9}{'LAST':>9}{'HIGH%':>8}{'SLOPE%':>8}{'REV':>5}  NAME"
-    lines = [f"{r['ticker']:<8}{r['line']:<11}{r['ma']:>9.2f}{r['low']:>9.2f}{r['last']:>9.2f}"
-             f"{r['from_hi']:>8.1f}{r['slope']:>+8.1f}{'  OK' if r['rev'] else '   -':>5}  {r['name'][:24]}" for r in rows]
+    """선 하나당 표 하나. 화면에서 줄이 접히지 않게 폭을 좁게 (LOW 열 생략, 이름 14자)"""
+    head = f"{'TICKER':<7}{'MA':>8}{'LAST':>8}{'HIGH%':>7}{'SLOPE%':>7}{'REV':>4}  NAME"
+    lines = [f"{r['ticker']:<7}{r['ma']:>8.2f}{r['last']:>8.2f}{r['from_hi']:>7.1f}{r['slope']:>+7.1f}"
+             f"{'OK' if r['rev'] else '-':>4}  {r['name'][:14]}" for r in rows]
     first = True
     while lines:
         block, size = [], 0
@@ -433,8 +437,10 @@ def send_lt_table(title: str, rows: list[dict]):
         header = f"**{title}**\n" if first else ""
         post(f"{header}```\n{head}\n" + "\n".join(block) + "\n```")
         first = False
-    post("D-SMA325 = 일봉 325일 SMA · W-VWMA100 = 주봉 100주 VWMA · M-VWMA100 = 월봉 100개월 VWMA\n"
-         f"HIGH% = 52주 고점 대비 · SLOPE% = 선의 상승률 (일봉 1개월·주봉 13주·월봉 6개월 전 대비) · REV OK = 종가가 당일 범위 상위 50% (반등 캔들)\n"
+
+
+def send_lt_note():
+    post(f"HIGH% = 52주 고점 대비 · SLOPE% = 선의 상승률 (일봉 1개월·주봉 13주·월봉 6개월 전 대비) · REV OK = 반등 캔들 (종가가 당일 범위 상위 50%)\n"
          f"조건: 고점 대비 -{LT_DRAWDOWN:.0f}% 이상 하락 · 선의 ±1%(일)/±2%(주)/±3%(월) 터치 · 선 위 마감 · 선이 상승 중 · "
          "최근 6개월(월봉 12개월) 동안 종가가 선 아래로 간 적 없음\n"
          "⚠️ 하락 종목의 바닥 잡기(역추세)입니다. 반등 캔들이나 다음 날 확인 후 진입을 권장합니다.")
@@ -543,9 +549,11 @@ def main():
                 sent.add(key)
                 lt_rows.append({"ticker": t, "name": str(meta[t].name) or company_name(t), **r})
     if lt_rows:
-        order = list(LT_LINES)
-        lt_rows.sort(key=lambda r: (order.index(r["line"]), r["from_hi"]))
-        send_lt_table(f"📉 장기 지지선 터치 {now:%b} {now.day} | 고점 대비 -{LT_DRAWDOWN:.0f}% 이상 하락 종목 ({len(lt_rows)})", lt_rows)
+        for line_name in LT_LINES:                       # 일봉 SMA325 / 주봉 VWMA100 / 월봉 VWMA100 각각 따로
+            rows = sorted([r for r in lt_rows if r["line"] == line_name], key=lambda r: r["from_hi"])
+            if rows:
+                send_lt_table(f"📉 {LT_TITLE[line_name]} 터치 {now:%b} {now.day} | 고점 대비 -{LT_DRAWDOWN:.0f}% 이상 하락 ({len(rows)})", rows)
+        send_lt_note()
     elif lt_run and FORCE:
         post("📉 장기 지지선 터치: 이번 실행에는 조건을 통과한 종목이 없습니다.")
 

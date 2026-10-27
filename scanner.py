@@ -1,7 +1,8 @@
 """
 MA 터치 스캐너
 - S&P 500 / Nasdaq 100 / Russell 2000(대형·고유동성만) / 내 관심종목을 훑어서
-- 당일 가격 범위가 50일 SMA, 100일 VWMA, 200일 SMA, 325일 SMA에 닿은 종목을
+- 당일 가격 범위가 50일 SMA, 100일 VWMA, 200일 SMA에 닿은 종목을
+- (별도 섹션) 많이 하락한 종목이 일봉 SMA325·주봉 VWMA100·월봉 VWMA100 장기 지지선에 닿은 경우
 - 디스코드 채널로 표 형태로 보냅니다.
 """
 import datetime as dt
@@ -14,6 +15,7 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -39,6 +41,16 @@ HP_NEAR_HIGH = float(os.environ.get("HP_NEAR_HIGH", "25"))       # ② 52주 고
 HP_RUNUP = float(os.environ.get("HP_RUNUP", "20"))               # ② 최근 3개월 안에 저점→고점 +20% 이상 상승한 이력
 HP_RUNUP_DAYS = int(os.environ.get("HP_RUNUP_DAYS", "63"))
 # ③ 강화된 정배열: 50일선 > 150일선 > 200일선 (항상 적용)
+# ── 📉 장기 지지선 (많이 하락한 종목 전용, 기존 조건과 별개) ──
+LT_ENABLE = os.environ.get("LT_ENABLE", "1") == "1"
+LT_DRAWDOWN = float(os.environ.get("LT_DRAWDOWN", "25"))           # 52주 고점 대비 -25% 이상 하락한 종목만
+LT_ONLY_LAST_RUN = os.environ.get("LT_ONLY_LAST_RUN", "1") == "1"  # 장 마감 무렵 회차(뉴욕 15:30 이후)에서만 판정
+# 선 이름: (봉, 종류, 기간, 터치 허용오차%, 기울기 비교 봉수, 첫 터치 확인 봉수)
+LT_LINES = {
+    "D-SMA325":  ("1d", "sma", 325, float(os.environ.get("LT_TOL_D", "1")), 21, 126),   # 1개월 전보다 상승, 6개월 첫 터치
+    "W-VWMA100": ("1wk", "vwma", 100, float(os.environ.get("LT_TOL_W", "2")), 13, 26),  # 13주 전보다 상승, 6개월 첫 터치
+    "M-VWMA100": ("1mo", "vwma", 100, float(os.environ.get("LT_TOL_M", "3")), 6, 12),   # 6개월 전보다 상승, 12개월 첫 터치
+}
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
 FORCE = os.environ.get("FORCE", "0") == "1"            # 장 시간이 아니어도 강제 실행
 # ──────────────────────────────────────────────────────
@@ -48,7 +60,7 @@ STATE = Path(__file__).parent / "state"
 STATE.mkdir(exist_ok=True)
 UA = {"User-Agent": "Mozilla/5.0 (ma-touch-scanner)"}
 GROUP_LABEL = {"sp500": "S&P 500", "nasdaq100": "Nasdaq 100", "russell2000": "Russell 2000", "watchlist": "Watchlist"}
-MA_NAMES = ["50D SMA", "100D VWMA", "200D SMA", "325D SMA"]
+MA_NAMES = ["50D SMA", "100D VWMA", "200D SMA"]
 BROWSER_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                             "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"}
 
@@ -192,7 +204,6 @@ def check_touches(df: pd.DataFrame, today: dt.date | None, spy_ret: dict | None 
         "50D SMA": c.rolling(50).mean(),
         "100D VWMA": (c * v).rolling(100).sum() / v.rolling(100).sum(),
         "200D SMA": c.rolling(200).mean(),
-        "325D SMA": c.rolling(325).mean(),   # 상장 325거래일 미만이면 이 선만 건너뜀
     }
     mas = {k: s.iloc[-1] for k, s in series.items()}
     s50, s200 = series["50D SMA"], series["200D SMA"]
@@ -344,6 +355,91 @@ def send_hp_table(title: str, rows: list[dict]):
          " · ③ 50일 > 150일 > 200일선 · 위에서 내려온 눌림 터치만")
 
 
+# ───────────── 📉 장기 지지선 ─────────────
+def lt_candidate(df: pd.DataFrame) -> bool:
+    """52주 고점 대비 LT_DRAWDOWN% 이상 하락 + 유동성"""
+    df = df.dropna(subset=["Close", "High", "Volume"])
+    if len(df) < 200:
+        return False
+    c = df["Close"]
+    if c.iloc[-1] < MIN_PRICE or (c * df["Volume"]).tail(50).mean() < MIN_DOLLAR_VOL:
+        return False
+    return c.iloc[-1] <= df["High"].tail(252).max() * (1 - LT_DRAWDOWN / 100)
+
+
+def download_bars(tickers: list[str], interval: str, period: str) -> dict[str, pd.DataFrame]:
+    import yfinance as yf
+    out = {}
+    for i in range(0, len(tickers), 100):
+        chunk = tickers[i:i + 100]
+        try:
+            data = yf.download(chunk, period=period, interval=interval, group_by="ticker",
+                               auto_adjust=False, threads=True, progress=False)
+        except Exception as e:
+            print(f"[경고] {interval} 시세 다운로드 실패: {e}")
+            continue
+        if not isinstance(data.columns, pd.MultiIndex):
+            data = pd.concat({chunk[0]: data}, axis=1)
+        have = set(data.columns.get_level_values(0))
+        for t in chunk:
+            if t in have:
+                out[t] = data[t].dropna(subset=["Close", "Volume"])
+        time.sleep(1)
+    return out
+
+
+def lt_check(daily: pd.DataFrame, bars: dict[str, pd.DataFrame]) -> list[dict]:
+    """bars = {"1d": 일봉, "1wk": 주봉, "1mo": 월봉}. 오늘 일봉의 저가·종가로 각 장기선 터치를 판정"""
+    d = daily.dropna(subset=["Close", "High", "Low", "Volume"])
+    last = d.iloc[-1]
+    hi52 = d["High"].tail(252).max()
+    rng = last["High"] - last["Low"]
+    rev = rng > 0 and (last["Close"] - last["Low"]) / rng >= 0.5        # 반등 캔들 (표시만)
+    out = []
+    for name, (iv, kind, n, tol, slope_n, first_n) in LT_LINES.items():
+        b = bars.get(iv)
+        if b is None or len(b) < n + max(slope_n, first_n) + 1:
+            continue                                                      # 데이터 부족 (상장 기간이 짧음)
+        c, v = b["Close"], b["Volume"]
+        line = c.rolling(n).mean() if kind == "sma" else (c * v).rolling(n).sum() / v.rolling(n).sum()
+        ma = float(line.iloc[-1])
+        if np.isnan(ma):
+            continue
+        t = tol / 100
+        touched = last["Low"] <= ma * (1 + t) and last["High"] >= ma * (1 - t)
+        if not touched or not last["Close"] > ma:                         # 터치 + 선 위 마감
+            continue
+        prev = float(line.iloc[-1 - slope_n])
+        if not ma > prev:                                                 # 선 자체가 상승 중이어야 지지
+            continue
+        past_c, past_l = c.iloc[-1 - first_n:-1], line.iloc[-1 - first_n:-1]
+        if past_l.isna().any() or (past_c <= past_l).any():               # 오랜만의 첫 터치
+            continue
+        out.append({"line": name, "ma": ma, "low": float(last["Low"]), "last": float(last["Close"]),
+                    "from_hi": (last["Close"] / hi52 - 1) * 100, "slope": (ma / prev - 1) * 100, "rev": rev})
+    return out
+
+
+def send_lt_table(title: str, rows: list[dict]):
+    head = f"{'TICKER':<8}{'LINE':<11}{'MA':>9}{'LOW':>9}{'LAST':>9}{'HIGH%':>8}{'SLOPE%':>8}{'REV':>5}  NAME"
+    lines = [f"{r['ticker']:<8}{r['line']:<11}{r['ma']:>9.2f}{r['low']:>9.2f}{r['last']:>9.2f}"
+             f"{r['from_hi']:>8.1f}{r['slope']:>+8.1f}{'  OK' if r['rev'] else '   -':>5}  {r['name'][:24]}" for r in rows]
+    first = True
+    while lines:
+        block, size = [], 0
+        while lines and size + len(lines[0]) + 1 < 1700:
+            size += len(lines[0]) + 1
+            block.append(lines.pop(0))
+        header = f"**{title}**\n" if first else ""
+        post(f"{header}```\n{head}\n" + "\n".join(block) + "\n```")
+        first = False
+    post("D-SMA325 = 일봉 325일 SMA · W-VWMA100 = 주봉 100주 VWMA · M-VWMA100 = 월봉 100개월 VWMA\n"
+         f"HIGH% = 52주 고점 대비 · SLOPE% = 선의 상승률 (일봉 1개월·주봉 13주·월봉 6개월 전 대비) · REV OK = 종가가 당일 범위 상위 50% (반등 캔들)\n"
+         f"조건: 고점 대비 -{LT_DRAWDOWN:.0f}% 이상 하락 · 선의 ±1%(일)/±2%(주)/±3%(월) 터치 · 선 위 마감 · 선이 상승 중 · "
+         "최근 6개월(월봉 12개월) 동안 종가가 선 아래로 간 적 없음\n"
+         "⚠️ 하락 종목의 바닥 잡기(역추세)입니다. 반등 캔들이나 다음 날 확인 후 진입을 권장합니다.")
+
+
 # ───────────── 실행 ─────────────
 def main():
     now = dt.datetime.now(NY)
@@ -390,9 +486,13 @@ def main():
 
     found: dict[tuple, list] = {}
     hp_rows: list[dict] = []
+    lt_daily: dict[str, pd.DataFrame] = {}
+    lt_run = LT_ENABLE and (FORCE or not LT_ONLY_LAST_RUN or now.time() >= dt.time(15, 30))
     scanned = 0
     for ticker, df in download(list(meta)):
         scanned += 1
+        if lt_run and (FORCE or df.index[-1].date() == today) and lt_candidate(df):
+            lt_daily[ticker] = df
         is_russell = group_of[ticker] == "russell2000"
         touches = check_touches(df, None if FORCE else today, spy_ret,
                                 RUSSELL_MIN_DOLLAR_VOL if is_russell else MIN_DOLLAR_VOL, frac)
@@ -429,10 +529,30 @@ def main():
     elif HP_ENABLE and FORCE:
         post("⭐ [확률높은종목] 이번 실행에는 조건을 모두 통과한 종목이 없습니다.")
 
+    lt_rows: list[dict] = []
+    if lt_run and lt_daily:
+        cands = list(lt_daily)
+        print(f"장기 지지선 후보 (고점 대비 -{LT_DRAWDOWN:.0f}% 이상) {len(cands)}종목")
+        weekly = download_bars(cands, "1wk", "5y")
+        monthly = download_bars(cands, "1mo", "max")
+        for t in cands:
+            for r in lt_check(lt_daily[t], {"1d": lt_daily[t], "1wk": weekly.get(t), "1mo": monthly.get(t)}):
+                key = f"LT|{t}|{r['line']}"
+                if key in sent:
+                    continue
+                sent.add(key)
+                lt_rows.append({"ticker": t, "name": str(meta[t].name) or company_name(t), **r})
+    if lt_rows:
+        order = list(LT_LINES)
+        lt_rows.sort(key=lambda r: (order.index(r["line"]), r["from_hi"]))
+        send_lt_table(f"📉 장기 지지선 터치 {now:%b} {now.day} | 고점 대비 -{LT_DRAWDOWN:.0f}% 이상 하락 종목 ({len(lt_rows)})", lt_rows)
+    elif lt_run and FORCE:
+        post("📉 장기 지지선 터치: 이번 실행에는 조건을 통과한 종목이 없습니다.")
+
     if scanned < len(meta) * 0.5:
         post(f"⚠️ MA 스캐너: 시세를 {scanned}/{len(meta)}종목만 받았습니다. 일시적 오류일 수 있습니다.")
     if FORCE:
-        post(f"✅ MA 스캐너 테스트 완료: {scanned}종목 확인, 터치 {total}건 · 확률높은종목 {len(hp_rows)}건 (최근 거래일 기준)")
+        post(f"✅ MA 스캐너 테스트 완료: {scanned}종목 확인, 터치 {total}건 · 확률높은종목 {len(hp_rows)}건 · 장기 지지선 {len(lt_rows)}건 (최근 거래일 기준)")
     else:
         sent_file.write_text(json.dumps(sorted(sent)))
 
